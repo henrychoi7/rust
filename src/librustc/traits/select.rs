@@ -3282,7 +3282,7 @@ impl<'cx, 'gcx, 'tcx> SelectionContext<'cx, 'gcx, 'tcx> {
         // that order.
         let predicates = tcx.predicates_of(def_id);
         assert_eq!(predicates.parent, None);
-        let predicates = predicates.predicates.iter().flat_map(|predicate| {
+        let mut predicates: Vec<_> = predicates.predicates.iter().flat_map(|predicate| {
             let predicate = normalize_with_depth(self, param_env, cause.clone(), recursion_depth,
                                                  &predicate.subst(tcx, substs));
             predicate.obligations.into_iter().chain(
@@ -3293,6 +3293,17 @@ impl<'cx, 'gcx, 'tcx> SelectionContext<'cx, 'gcx, 'tcx> {
                     predicate: predicate.value
                 }))
         }).collect();
+        if predicates.len() > 1 {
+            let mut i = 0;
+            while i != predicates.len() {
+                let has_dup = (0..i).any(|j| predicates[i] == predicates[j]);
+                if has_dup {
+                    predicates.swap_remove(i);
+                } else {
+                    i += 1;
+                }
+            }
+        }
         self.infcx().plug_leaks(skol_map, snapshot, predicates)
     }
 }

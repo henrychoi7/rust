@@ -16,6 +16,7 @@ use super::translate_substs;
 use super::Obligation;
 use super::ObligationCause;
 use super::PredicateObligation;
+use super::Selection;
 use super::SelectionContext;
 use super::SelectionError;
 use super::VtableClosureData;
@@ -110,7 +111,7 @@ enum ProjectionTyCandidate<'tcx> {
     TraitDef(ty::PolyProjectionPredicate<'tcx>),
 
     // from a "impl" (or a "pseudo-impl" returned by select)
-    Select,
+    Select(Selection<'tcx>),
 }
 
 struct ProjectionTyCandidateSet<'tcx> {
@@ -818,44 +819,56 @@ fn project_type<'cx, 'gcx, 'tcx>(
                                        &obligation_trait_ref,
                                        &mut candidates);
 
+    let decide_commit = |candidates: &mut ProjectionTyCandidateSet<'tcx>| {
+        debug!("{} candidates, ambiguous={}",
+               candidates.vec.len(),
+               candidates.ambiguous);
+
+        // Prefer where-clauses. As in select, if there are multiple
+        // candidates, we prefer where-clause candidates over impls.  This
+        // may seem a bit surprising, since impls are the source of
+        // "truth" in some sense, but in fact some of the impls that SEEM
+        // applicable are not, because of nested obligations. Where
+        // clauses are the safer choice. See the comment on
+        // `select::SelectionCandidate` and #21974 for more details.
+        if candidates.vec.len() > 1 {
+            debug!("retaining param-env candidates only from {:?}", candidates.vec);
+            candidates.vec.retain(|c| match *c {
+                ProjectionTyCandidate::ParamEnv(..) => true,
+                ProjectionTyCandidate::TraitDef(..) |
+                ProjectionTyCandidate::Select(..) => false,
+            });
+            debug!("resulting candidate set: {:?}", candidates.vec);
+            if candidates.vec.len() != 1 {
+                candidates.ambiguous = true;
+                return false;
+            }
+        }
+
+        assert!(candidates.vec.len() <= 1);
+        match candidates.vec.get(0) {
+            Some(&ProjectionTyCandidate::Select(..)) => true,
+            _ => false,
+        }
+    };
+
+    // Note that at here, if `ProjectionTyCandidate::Select` is not going to be
+    // a valid candidate, the closure is not executed at all. There are two cases,
+    // one being trait selection error, and another being ambiguous candidates.
+    // We handle both by the early return below.
     if let Err(e) = assemble_candidates_from_impls(selcx,
                                                    obligation,
                                                    &obligation_trait_ref,
-                                                   &mut candidates) {
+                                                   &mut candidates,
+                                                   decide_commit) {
         return Err(ProjectionTyError::TraitSelectionError(e));
     }
-
-    debug!("{} candidates, ambiguous={}",
-           candidates.vec.len(),
-           candidates.ambiguous);
 
     // Inherent ambiguity that prevents us from even enumerating the
     // candidates.
     if candidates.ambiguous {
         return Err(ProjectionTyError::TooManyCandidates);
     }
-
-    // Prefer where-clauses. As in select, if there are multiple
-    // candidates, we prefer where-clause candidates over impls.  This
-    // may seem a bit surprising, since impls are the source of
-    // "truth" in some sense, but in fact some of the impls that SEEM
-    // applicable are not, because of nested obligations. Where
-    // clauses are the safer choice. See the comment on
-    // `select::SelectionCandidate` and #21974 for more details.
-    if candidates.vec.len() > 1 {
-        debug!("retaining param-env candidates only from {:?}", candidates.vec);
-        candidates.vec.retain(|c| match *c {
-            ProjectionTyCandidate::ParamEnv(..) => true,
-            ProjectionTyCandidate::TraitDef(..) |
-            ProjectionTyCandidate::Select => false,
-        });
-        debug!("resulting candidate set: {:?}", candidates.vec);
-        if candidates.vec.len() != 1 {
-            return Err(ProjectionTyError::TooManyCandidates);
-        }
-    }
-
-    assert!(candidates.vec.len() <= 1);
 
     match candidates.vec.pop() {
         Some(candidate) => {
@@ -952,7 +965,7 @@ fn assemble_candidates_from_predicates<'cx, 'gcx, 'tcx, I>(
         debug!("assemble_candidates_from_predicates: predicate={:?}",
                predicate);
         match predicate {
-            ty::Predicate::Projection(ref data) => {
+            ty::Predicate::Projection(data) => {
                 let same_def_id =
                     data.0.projection_ty.item_def_id == obligation.predicate.item_def_id;
 
@@ -975,26 +988,33 @@ fn assemble_candidates_from_predicates<'cx, 'gcx, 'tcx, I>(
                        data, is_match, same_def_id);
 
                 if is_match {
-                    candidate_set.vec.push(ctor(data.clone()));
+                    candidate_set.vec.push(ctor(data));
                 }
             }
-            _ => { }
+            _ => {}
         }
     }
 }
 
-fn assemble_candidates_from_impls<'cx, 'gcx, 'tcx>(
+enum NoImplCandidateError<'tcx> {
+    CanceledCommit,
+    SelectionError(SelectionError<'tcx>),
+}
+
+fn assemble_candidates_from_impls<'cx, 'gcx, 'tcx,
+    F: FnOnce(&mut ProjectionTyCandidateSet<'tcx>) -> bool>(
     selcx: &mut SelectionContext<'cx, 'gcx, 'tcx>,
     obligation: &ProjectionTyObligation<'tcx>,
     obligation_trait_ref: &ty::TraitRef<'tcx>,
-    candidate_set: &mut ProjectionTyCandidateSet<'tcx>)
+    candidate_set: &mut ProjectionTyCandidateSet<'tcx>,
+    decide_commit: F)
     -> Result<(), SelectionError<'tcx>>
 {
     // If we are resolving `<T as TraitRef<...>>::Item == Type`,
     // start out by selecting the predicate `T as TraitRef<...>`:
     let poly_trait_ref = obligation_trait_ref.to_poly_trait_ref();
     let trait_obligation = obligation.with(poly_trait_ref.to_poly_trait_predicate());
-    selcx.infcx().probe(|_| {
+    match selcx.infcx().commit_if_ok(|_| {
         let vtable = match selcx.select(&trait_obligation) {
             Ok(Some(vtable)) => vtable,
             Ok(None) => {
@@ -1004,21 +1024,20 @@ fn assemble_candidates_from_impls<'cx, 'gcx, 'tcx>(
             Err(e) => {
                 debug!("assemble_candidates_from_impls: selection error {:?}",
                        e);
-                return Err(e);
+                return Err(NoImplCandidateError::SelectionError(e));
             }
         };
 
-        match vtable {
-            super::VtableClosure(_) |
-            super::VtableGenerator(_) |
-            super::VtableFnPointer(_) |
-            super::VtableObject(_) => {
+        let eligible = match &vtable {
+            &super::VtableClosure(_) |
+            &super::VtableGenerator(_) |
+            &super::VtableFnPointer(_) |
+            &super::VtableObject(_) => {
                 debug!("assemble_candidates_from_impls: vtable={:?}",
                        vtable);
-
-                candidate_set.vec.push(ProjectionTyCandidate::Select);
+                true
             }
-            super::VtableImpl(ref impl_data) => {
+            &super::VtableImpl(ref impl_data) => {
                 // We have to be careful when projecting out of an
                 // impl because of specialization. If we are not in
                 // trans (i.e., projection mode is not "any"), and the
@@ -1062,29 +1081,27 @@ fn assemble_candidates_from_impls<'cx, 'gcx, 'tcx>(
                     node_item.item.defaultness.has_value()
                 } else {
                     node_item.item.defaultness.is_default() ||
-                    selcx.tcx().impl_is_default(node_item.node.def_id())
+                        selcx.tcx().impl_is_default(node_item.node.def_id())
                 };
 
                 // Only reveal a specializable default if we're past type-checking
                 // and the obligations is monomorphic, otherwise passes such as
                 // transmute checking and polymorphic MIR optimizations could
                 // get a result which isn't correct for all monomorphizations.
-                let new_candidate = if !is_default {
-                    Some(ProjectionTyCandidate::Select)
+                if !is_default {
+                    true
                 } else if obligation.param_env.reveal == Reveal::All {
                     assert!(!poly_trait_ref.needs_infer());
                     if !poly_trait_ref.needs_subst() {
-                        Some(ProjectionTyCandidate::Select)
+                        true
                     } else {
-                        None
+                        false
                     }
                 } else {
-                    None
-                };
-
-                candidate_set.vec.extend(new_candidate);
+                    false
+                }
             }
-            super::VtableParam(..) => {
+            &super::VtableParam(..) => {
                 // This case tell us nothing about the value of an
                 // associated type. Consider:
                 //
@@ -1110,19 +1127,32 @@ fn assemble_candidates_from_impls<'cx, 'gcx, 'tcx>(
                 // in the compiler: a trait predicate (`T : SomeTrait`) and a
                 // projection. And the projection where clause is handled
                 // in `assemble_candidates_from_param_env`.
+                false
             }
-            super::VtableAutoImpl(..) |
-            super::VtableBuiltin(..) => {
+            &super::VtableAutoImpl(..) |
+            &super::VtableBuiltin(..) => {
                 // These traits have no associated types.
                 span_bug!(
                     obligation.cause.span,
                     "Cannot project an associated type from `{:?}`",
                     vtable);
             }
+        };
+
+        if eligible {
+            candidate_set.vec.push(ProjectionTyCandidate::Select(vtable));
         }
 
-        Ok(())
-    })
+        if decide_commit(candidate_set) {
+            Ok(())
+        } else {
+            Err(NoImplCandidateError::CanceledCommit)
+        }
+    }) {
+        Ok(()) => Ok(()),
+        Err(NoImplCandidateError::CanceledCommit) => Ok(()),
+        Err(NoImplCandidateError::SelectionError(e)) => Err(e),
+    }
 }
 
 fn confirm_candidate<'cx, 'gcx, 'tcx>(
@@ -1142,8 +1172,8 @@ fn confirm_candidate<'cx, 'gcx, 'tcx>(
             confirm_param_env_candidate(selcx, obligation, poly_projection)
         }
 
-        ProjectionTyCandidate::Select => {
-            confirm_select_candidate(selcx, obligation, obligation_trait_ref)
+        ProjectionTyCandidate::Select(vtable) => {
+            confirm_select_candidate(selcx, obligation, obligation_trait_ref, vtable)
         }
     }
 }
@@ -1151,21 +1181,10 @@ fn confirm_candidate<'cx, 'gcx, 'tcx>(
 fn confirm_select_candidate<'cx, 'gcx, 'tcx>(
     selcx: &mut SelectionContext<'cx, 'gcx, 'tcx>,
     obligation: &ProjectionTyObligation<'tcx>,
-    obligation_trait_ref: &ty::TraitRef<'tcx>)
+    obligation_trait_ref: &ty::TraitRef<'tcx>,
+    vtable: Selection<'tcx>)
     -> Progress<'tcx>
 {
-    let poly_trait_ref = obligation_trait_ref.to_poly_trait_ref();
-    let trait_obligation = obligation.with(poly_trait_ref.to_poly_trait_predicate());
-    let vtable = match selcx.select(&trait_obligation) {
-        Ok(Some(vtable)) => vtable,
-        _ => {
-            span_bug!(
-                obligation.cause.span,
-                "Failed to select `{:?}`",
-                trait_obligation);
-        }
-    };
-
     match vtable {
         super::VtableImpl(data) =>
             confirm_impl_candidate(selcx, obligation, data),
